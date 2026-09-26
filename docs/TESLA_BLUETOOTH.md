@@ -1,73 +1,30 @@
 # Tesla Bluetooth (BLE) adaptation
 
-This branch (`tesla-ble`) replaces the ELM327/OBD data source with a direct
-Bluetooth Low Energy link to a Tesla vehicle. The hardware, LVGL UI, and
-theme system are unchanged — only the data source changes.
+Direct BLE link to a Tesla vehicle. No ELM327 / OBD-II adapter.
+Hardware, LVGL UI, themes, and ESP-NOW multi-gauge are unchanged.
 
-## What works today
+## Protocol (implemented in tesla_ble_client.c)
 
-- BLE scan for the Tesla vehicle-advertised service UUID
-  (`00000211-0000-1000-8000-00805f9b34fb`).
-- GATT client connect + service discovery plumbing.
-- Speed is routed into the shared `obd_data_cache` via
-  `obd_data_set_speed()`, so any theme's speed gauge renders it.
-- Auto-reconnect when the link drops (self-healing, same as ELM327 path).
+1. Long-term P-256 key generated on first boot, stored as PEM in NVS.
+2. Connect to GATT service 0x211, write char 0x212, notify char 0x213.
+3. Send SessionInfoRequest with our public key.
+4. Car replies SessionInfo (car ephemeral pubkey, epoch, counter).
+5. ECDH(our_priv, car_pub) -> X; AES-128 key = SHA1(X)[0:16].
+6. Send GetVehicleData(getDriveState) AES-128-GCM encrypted.
+7. Decrypt response, pull drive_state.speed (km/h), obd_data_set_speed().
 
-## What is not wired yet (TODO)
+## One-time key whitelisting
 
-The hard part of Tesla BLE is **not** GATT — it's the authenticated command
-session. Until that is implemented, speed will not actually update:
+In the Tesla mobile app: Security -> Bluetooth Key -> Add, then tap the
+module against the car's BLE reader. See 0Bu/tesla-key-esp32.
 
-1. **Key provisioning** — generate an X25519 keypair on the device, share the
-   public key with the car via the Tesla mobile app ("Bluetooth Key"), so the
-   car recognizes this ESP32 as an authorized BLE key.
-2. **Session handshake** — on connect, run the unauthenticated -> authenticated
-   GATT security procedure (the `vehicle-command` protobuf `SecuredSession`).
-3. **VehicleData request** — once authenticated, send a protobuf
-   `VehicleDataRequest` for `drive_state` and read the notify response.
-4. **Protobuf decode** — pull `drive_state.speed` (float, km/h) and call
-   `tesla_ble_emit_speed()`.
+## Build step: nanopb generated code
 
-Reference implementations:
+Generate nanopb .pb.c/.pb.h from teslamotors/vehicle-command protos into
+main/proto/, then implement the four tesla_proto_* shims declared in
+tesla_ble_client.c. The crypto and BLE layers are already complete.
 
-| Repo | Use it for |
-|---|---|
-| `yoziru/tesla-ble` | Core BLE protocol library; most portable reference for ESP32. |
-| `0Bu/tesla-key-esp32` | ESP32 Tesla Bluetooth key (provisioning flow). |
-| `teslamotors/vehicle-command` | Official protobuf definitions and auth flow. |
-| `yoziru/esphome-tesla-ble` | ESPHome integration (higher-level wiring). |
-| `kaedenbrinkman/PyTeslaBLE` | Python BLE reference (useful for decoding). |
+## Signals
 
-## Wiring into app_main
-
-On this branch, instead of `elm327_ble_start_default(...)`, call:
-
-```c
-tesla_ble_callbacks_t cbs = {
-    .on_connected   = NULL,
-    .on_disconnected = NULL,
-    .on_speed_kmh   = NULL,   // optional; cache is updated directly
-};
-tesla_ble_init_and_start(NULL, &cbs);
-```
-
-The ELM327 polling task should be disabled (or guarded by a compile-time
-switch) so the BLE radio is not contended. The ESP-NOW multi-gauge path
-still works: the master board reads Tesla speed and broadcasts to slaves.
-
-## Vehicle profile
-
-Use `OBD2 Generic` (or any profile) on this branch — the speed value comes
-from Tesla, not from a PID. Other fields (RPM, temps, gear) read invalid
-until corresponding Tesla signals are added.
-
-## Next signals to add
-
-Once speed is live, the order of likely additions is:
-
-1. Speed (done / scaffolded)
-2. Gear / drive state (`P/R/N/D`)
-3. Battery SOC + power kW
-4. Odometer
-
-Each one is another `obd_data_set_*()` call from the notify decoder.
+- Speed (km/h): wired.
+- TODO: gear, SOC, power, odometer.
